@@ -1,88 +1,121 @@
-#include <painlessMesh.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
 
-#define MESH_PREFIX   "Lab5Medan"
-#define MESH_PASSWORD "Medan1234"
-#define MESH_PORT     8080
+// Kredensial Jaringan Wi-Fi
+const char* ssid = "ramadhani";
+const char* password = "rama1234";
 
-#define DHTPIN  D4
-#define DHTTYPE DHT22
+// Konfigurasi Broker MQTT Publik
+const char* mqttServer = "broker.hivemq.com";
+const int mqttPort = 1883;
+const char* clientId = "ESP8266_LabIoT_25782045_Full";
 
-DHT dht(DHTPIN, DHTTYPE);
+// Pembagian Topik Mandiri
+const char* topicPublish   = "kampus/labiot/25782045/telemetri";
+const char* topicSubscribe = "kampus/labiot/25782045/kendali";
 
-Scheduler userScheduler;
-painlessMesh mesh;
+// Alokasi Pin Perangkat Keras
+const byte dhtPin = 2; // Pin D4 (GPIO 2)
+const byte ledPin = 5; // Pin D1 (GPIO 5)
+#define DHTTYPE DHT11
 
-void sendMessage();
+DHT dht(dhtPin, DHTTYPE);
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-Task taskSendMessage(
-  TASK_SECOND * 3,
-  TASK_FOREVER,
-  &sendMessage
-);
+unsigned long lastTelemetryTime = 0;
+const unsigned long telemetryInterval = 4000; // Siklus kirim 4 detik
 
-void sendMessage() {
+void callback(char* topic, byte* payload, unsigned int length) {
+  char incomingBuffer[length + 1];
+  memcpy(incomingBuffer, payload, length);
+  incomingBuffer[length] = '\0';
 
-  float suhu = dht.readTemperature();
-  float kelembapan = dht.readHumidity();
+  Serial.println("----------------------------------------");
+  Serial.printf("[KONTROL DITERIMA] Topik: %s | Payload: %s\n", topic, incomingBuffer);
 
-  if (isnan(suhu) || isnan(kelembapan)) {
-    Serial.println("ERROR DHT");
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, incomingBuffer);
+  if (err) {
+    Serial.println("Gagal membedah payload JSON!");
     return;
   }
 
-  StaticJsonDocument<200> doc;
+  if (doc.containsKey("led")) {
+    int val = doc["led"];
+    digitalWrite(ledPin, val == 1 ? HIGH : LOW);
+    Serial.printf("--> [INDIKATOR] Status LED diubah: %s\n", val == 1 ? "MENYALA" : "PADAM");
+  }
+  Serial.println("----------------------------------------");
+}
 
-  doc["tipe"] = "suhu_node";
-  doc["suhu"] = suhu;
-  doc["kelembapan"] = kelembapan;
-
-  String msg;
-  serializeJson(doc, msg);
-
-  mesh.sendBroadcast(msg);
-
-  Serial.println("### NODE 1 MESH ###");
-  Serial.println("DATA JSON:");
-  Serial.println(msg);
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Menghubungkan kembali ke Broker...");
+    if (client.connect(clientId)) {
+      Serial.println(" Sukses Terhubung!");
+      client.subscribe(topicSubscribe);
+      Serial.printf("Subskripsi Topik: %s\n", topicSubscribe);
+    } else {
+      Serial.printf("Gagal (rc=%d). Coba lagi dalam 4 detik...\n", client.state());
+      delay(4000);
+    }
+  }
 }
 
 void setup() {
-
   Serial.begin(115200);
-
-  delay(2000);
-
-  Serial.println();
-  Serial.println("############################");
-  Serial.println("PROGRAM BARU NODE 1");
-  Serial.println("ESP8266 + DHT22 + MESH");
-  Serial.println("############################");
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
 
   dht.begin();
 
-  delay(2000);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Menghubungkan Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Terkoneksi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
-  mesh.setDebugMsgTypes(
-    ERROR |
-    STARTUP |
-    CONNECTION
-  );
-
-  mesh.init(
-    MESH_PREFIX,
-    MESH_PASSWORD,
-    &userScheduler,
-    MESH_PORT
-  );
-
-  userScheduler.addTask(taskSendMessage);
-  taskSendMessage.enable();
-
-  Serial.println("NODE 1 SUDAH AKTIF");
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
 }
 
 void loop() {
-  mesh.update();
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop(); // Memelihara sesi TCP dan memproses callback masuk
+
+  unsigned long now = millis();
+  if (now - lastTelemetryTime >= telemetryInterval) {
+    lastTelemetryTime = now;
+
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (!isnan(t) && !isnan(h)) {
+      StaticJsonDocument<256> docOut;
+      docOut["node_id"] = clientId;
+      docOut["suhu"] = serialized(String(t, 2));
+      docOut["kelembapan"] = serialized(String(h, 2));
+      docOut["status_led"] = digitalRead(ledPin);
+
+      char buffer[256];
+      serializeJson(docOut, buffer);
+      
+      bool success = client.publish(topicPublish, buffer);
+      if (success) {
+        Serial.printf("[TELEMETRI TERKIRIM] %s\n", buffer);
+      } else {
+        Serial.println("[ERROR] Gagal memublikasikan telemetri!");
+      }
+    }
+  }
 }
